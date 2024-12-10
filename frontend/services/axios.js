@@ -20,7 +20,7 @@ const RETRY_CONFIG = {
 
 // 기본 설정으로 axios 인스턴스 생성
 const axiosInstance = axios.create({
-  baseURL: API_BASE_URL || 'http://localhost:5000',
+  baseURL: API_BASE_URL || 'http://localhost:5001',
   timeout: 30000,
   withCredentials: true,
   headers: {

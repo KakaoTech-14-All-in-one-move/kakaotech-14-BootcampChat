@@ -180,7 +180,7 @@ status_services() {
   echo "\n포트 사용 현황:"
   echo "MongoDB (27017):" $(lsof -i:27017 | grep LISTEN || echo "미사용")
   echo "Redis (6379):" $(lsof -i:6379 | grep LISTEN || echo "미사용")
-  echo "Backend (5000):" $(lsof -i:5000 | grep LISTEN || echo "미사용")
+  echo "Backend (5001):" $(lsof -i:5001 | grep LISTEN || echo "미사용")
   echo "Frontend (3000):" $(lsof -i:3000 | grep LISTEN || echo "미사용")
 }
 
