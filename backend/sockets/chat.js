@@ -138,15 +138,27 @@ module.exports = function (io) {
 
       if (message) {
         await message.save();
+        console.log("[MongoDB] Message saved:", {
+          messageId: message._id,
+          room: message.room,
+          type: message.type,
+          timestamp: new Date(),
+        });
+
         await message.populate([
           { path: "sender", select: "name email profileImage" },
           { path: "file", select: "filename originalname mimetype size" },
         ]);
+        console.log("[MongoDB] Message populated with sender and file info");
 
         // Redis 캐시 업데이트 수정
         try {
           const redisKey = `room:${room}:messages`;
           const cachedMessages = (await redisClient.get(redisKey)) || [];
+          console.log(
+            "[Redis] Current cached messages count:",
+            Array.isArray(cachedMessages) ? cachedMessages.length : 0
+          );
 
           // 새 메시지를 배열 앞에 추가
           if (Array.isArray(cachedMessages)) {
@@ -154,12 +166,21 @@ module.exports = function (io) {
             // 최근 100개 메시지만 유지
             const updatedMessages = cachedMessages.slice(0, 100);
             await redisClient.set(redisKey, updatedMessages);
+            console.log(
+              "[Redis] Cache updated with new message. Total messages:",
+              updatedMessages.length
+            );
           } else {
             // 캐시가 없거나 유효하지 않은 경우 새로 시작
             await redisClient.set(redisKey, [message]);
+            console.log("[Redis] New cache created with message");
           }
         } catch (redisError) {
-          console.error("Redis cache update error:", redisError);
+          console.error("[Redis] Cache update error:", {
+            error: redisError.message,
+            room,
+            messageId: message._id,
+          });
           // Redis 에러가 발생해도 메시지 처리는 계속 진행
         }
       }
