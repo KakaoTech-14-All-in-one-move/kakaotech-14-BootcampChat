@@ -723,13 +723,6 @@ module.exports = function (io) {
         }
 
         await SessionService.updateLastActivity(socket.user.id);
-
-        // RabbitMQ로만 메시지를 전송하므로 이 로그는 불필요
-        logDebug("message sent to queue", {
-          room,
-          type,
-          timestamp: new Date(),
-        });
       } catch (error) {
         console.error("Message handling error:", error);
         socket.emit("error", {
