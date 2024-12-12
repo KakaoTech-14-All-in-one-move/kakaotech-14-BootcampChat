@@ -703,10 +703,11 @@ module.exports = function (io) {
 
         await SessionService.updateLastActivity(socket.user.id);
 
-        logDebug("message processed", {
-          messageId: message._id,
-          type: message.type,
+        // RabbitMQ로만 메시지를 전송하므로 이 로그는 불필요
+        logDebug("message sent to queue", {
           room,
+          type,
+          timestamp: new Date(),
         });
       } catch (error) {
         console.error("Message handling error:", error);
