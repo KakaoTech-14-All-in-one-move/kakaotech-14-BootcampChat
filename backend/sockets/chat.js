@@ -7,6 +7,7 @@ const { jwtSecret } = require("../config/keys");
 const redisClient = require("../utils/redisClient");
 const SessionService = require("../services/sessionService");
 const aiService = require("../services/aiService");
+const s3Service = require("../services/S3Service");
 const amqp = require("amqplib");
 
 module.exports = function (io) {
@@ -103,6 +104,31 @@ module.exports = function (io) {
             });
 
             if (file) {
+              let s3FileData = null;
+
+              // 파일이 local에 있는 경우 S3로 업로드
+              if (!file.s3Key && file.path) {
+                try {
+                  const key = s3Service.generateKey(file, sender);
+                  s3FileData = await s3Service.uploadFile(
+                    {
+                      path: file.path,
+                      mimetype: file.mimetype,
+                      originalname: file.originalname,
+                    },
+                    key
+                  );
+
+                  // 파일 정보 업데이트
+                  file.s3Key = s3FileData.key;
+                  file.s3Url = s3FileData.url;
+                  await file.save();
+                } catch (uploadError) {
+                  console.error("S3 upload error:", uploadError);
+                  throw new Error("파일 업로드 중 오류가 발생했습니다.");
+                }
+              }
+
               message = new Message({
                 room,
                 sender,
@@ -115,6 +141,8 @@ module.exports = function (io) {
                   fileType: file.mimetype,
                   fileSize: file.size,
                   originalName: file.originalname,
+                  s3Key: file.s3Key,
+                  s3Url: file.s3Url,
                 },
               });
             }
@@ -147,23 +175,20 @@ module.exports = function (io) {
 
         await message.populate([
           { path: "sender", select: "name email profileImage" },
-          { path: "file", select: "filename originalname mimetype size" },
+          {
+            path: "file",
+            select: "filename originalname mimetype size s3Key s3Url",
+          },
         ]);
         console.log("[MongoDB] Message populated with sender and file info");
 
-        // Redis 캐시 업데이트 수정
+        // Redis 캐시 업데이트
         try {
           const redisKey = `room:${room}:messages`;
           const cachedMessages = (await redisClient.get(redisKey)) || [];
-          console.log(
-            "[Redis] Current cached messages count:",
-            Array.isArray(cachedMessages) ? cachedMessages.length : 0
-          );
 
-          // 새 메시지를 배열 앞에 추가
           if (Array.isArray(cachedMessages)) {
             cachedMessages.unshift(message);
-            // 최근 100개 메시지만 유지
             const updatedMessages = cachedMessages.slice(0, 100);
             await redisClient.set(redisKey, updatedMessages);
             console.log(
@@ -171,7 +196,6 @@ module.exports = function (io) {
               updatedMessages.length
             );
           } else {
-            // 캐시가 없거나 유효하지 않은 경우 새로 시작
             await redisClient.set(redisKey, [message]);
             console.log("[Redis] New cache created with message");
           }
@@ -181,7 +205,6 @@ module.exports = function (io) {
             room,
             messageId: message._id,
           });
-          // Redis 에러가 발생해도 메시지 처리는 계속 진행
         }
       }
 
@@ -469,6 +492,43 @@ module.exports = function (io) {
       // 새로운 연결 정보 저장
       connectedUsers.set(socket.user.id, socket.id);
     }
+
+    // 파일 삭제 이벤트 핸들러 추가
+    socket.on("deleteFile", async ({ fileId, messageId }) => {
+      try {
+        if (!socket.user) {
+          throw new Error("Unauthorized");
+        }
+
+        const file = await File.findOne({
+          _id: fileId,
+          user: socket.user.id,
+        });
+
+        if (!file) {
+          throw new Error("파일을 찾을 수 없습니다.");
+        }
+
+        // S3에서 파일 삭제
+        if (file.s3Key) {
+          await s3Service.deleteFile(file.s3Key);
+        }
+
+        // 메시지에서 파일 참조 제거
+        if (messageId) {
+          await Message.updateOne({ _id: messageId }, { $unset: { file: 1 } });
+        }
+
+        await file.deleteOne();
+
+        socket.emit("fileDeleted", { fileId, messageId });
+      } catch (error) {
+        console.error("File deletion error:", error);
+        socket.emit("error", {
+          message: error.message || "파일 삭제 중 오류가 발생했습니다.",
+        });
+      }
+    });
 
     // 이전 메시지 로딩 처리 개선
     socket.on("fetchPreviousMessages", async ({ roomId, before }) => {
@@ -1133,6 +1193,5 @@ module.exports = function (io) {
       });
     }
   }
-
   return io;
 };
