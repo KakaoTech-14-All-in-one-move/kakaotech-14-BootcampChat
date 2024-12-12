@@ -691,66 +691,6 @@ module.exports = function (io) {
           hasAIMentions: aiMentions.length,
         });
 
-        // 메시지 타입별 처리
-        switch (type) {
-          case "file":
-            if (!fileData || !fileData._id) {
-              throw new Error("파일 데이터가 올바르지 않습니다.");
-            }
-
-            const file = await File.findOne({
-              _id: fileData._id,
-              user: socket.user.id,
-            });
-
-            if (!file) {
-              throw new Error("파일을 찾을 수 없거나 접근 권한이 없습니다.");
-            }
-
-            message = new Message({
-              room,
-              sender: socket.user.id,
-              type: "file",
-              file: file._id,
-              content: content || "",
-              timestamp: new Date(),
-              reactions: {},
-              metadata: {
-                fileType: file.mimetype,
-                fileSize: file.size,
-                originalName: file.originalname,
-              },
-            });
-            break;
-
-          case "text":
-            const messageContent = content?.trim() || messageData.msg?.trim();
-            if (!messageContent) {
-              return;
-            }
-
-            message = new Message({
-              room,
-              sender: socket.user.id,
-              content: messageContent,
-              type: "text",
-              timestamp: new Date(),
-              reactions: {},
-            });
-            break;
-
-          default:
-            throw new Error("지원하지 않는 메시지 타입입니다.");
-        }
-
-        await message.save();
-        await message.populate([
-          { path: "sender", select: "name email profileImage" },
-          { path: "file", select: "filename originalname mimetype size" },
-        ]);
-
-        io.to(room).emit("message", message);
-
         // AI 멘션이 있는 경우 AI 응답 생성
         if (aiMentions.length > 0) {
           for (const ai of aiMentions) {
