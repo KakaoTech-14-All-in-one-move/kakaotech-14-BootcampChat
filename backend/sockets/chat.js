@@ -31,6 +31,15 @@ module.exports = function (io) {
   // RabbitMQ 연결 설정
   const connectMessageQueue = async () => {
     try {
+      // 기존 연결이 있다면 정리
+      if (messageQueueChannel) {
+        try {
+          await messageQueueChannel.close();
+        } catch (err) {
+          console.error("기존 채널 정리 중 에러:", err);
+        }
+      }
+
       const connection = await amqp.connect(
         `amqp://admin:admin123@${MASTER_HOST}:${QUEUE_PORT}`
       );
