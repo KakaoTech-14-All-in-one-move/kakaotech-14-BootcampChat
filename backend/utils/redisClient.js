@@ -13,6 +13,7 @@ const {
 
 class RedisClient {
     constructor() {
+      console.log('HOST:', process.env.SENTINEL_HOST1);
         this.client = null;
         this.isConnected = false;
         this.connectionAttempts = 0;
