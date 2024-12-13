@@ -9,109 +9,146 @@ const SessionService = require("../services/sessionService");
 const aiService = require("../services/aiService");
 const s3Service = require("../services/S3Service");
 const amqp = require("amqplib");
+const { v4: uuidv4 } = require("uuid");
 
 module.exports = function (io) {
+  const SERVER_ID = uuidv4();
   const connectedUsers = new Map();
   const streamingSessions = new Map();
   const userRooms = new Map();
-  const messageQueues = new Map();
-  const messageLoadRetries = new Map();
-  let messageQueueChannel = null;
+  const messageQueues = new Map(); // 추가
+  const messageLoadRetries = new Map(); // 추가
 
-  const BATCH_SIZE = 30; // 한 번에 로드할 메시지 수
-  const LOAD_DELAY = 300; // 메시지 로드 딜레이 (ms)
-  const MAX_RETRIES = 3; // 최대 재시도 횟수
-  const MESSAGE_LOAD_TIMEOUT = 10000; // 메시지 로드 타임아웃 (10초)
-  const RETRY_DELAY = 2000; // 재시도 간격 (2초)
-  const DUPLICATE_LOGIN_TIMEOUT = 10000; // 중복 로그인 타임아웃 (10초)
+  const BATCH_SIZE = 30;
+  const LOAD_DELAY = 300;
+  const MAX_RETRIES = 3;
+  const MESSAGE_LOAD_TIMEOUT = 10000;
+  const RETRY_DELAY = 2000;
+  const DUPLICATE_LOGIN_TIMEOUT = 10000;
   const MASTER_HOST = "43.201.104.54";
   const SLAVE_HOSTS = ["13.124.74.7", "43.201.247.89"];
   const QUEUE_PORT = "5672";
 
-  // RabbitMQ 연결 설정
-  const connectMessageQueue = async () => {
-    try {
-      // 기존 연결이 있다면 정리
-      if (messageQueueChannel) {
+  const queueManager = {
+    connection: null,
+    channel: null,
+
+    async initialize() {
+      try {
+        // 기존 연결 정리
+        if (this.channel) {
+          await this.channel.close().catch(console.error);
+        }
+        if (this.connection) {
+          await this.connection.close().catch(console.error);
+        }
+
+        let lastError;
+        // 마스터 노드 시도
         try {
-          await messageQueueChannel.close();
-        } catch (err) {
-          console.error("기존 채널 정리 중 에러:", err);
-        }
-      }
+          this.connection = await this.connectToHost(MASTER_HOST);
+          console.log(`[RabbitMQ] Master(${MASTER_HOST}) 연결 성공`);
+        } catch (masterError) {
+          lastError = masterError;
+          console.error(
+            `[RabbitMQ] Master(${MASTER_HOST}) 연결 실패:`,
+            masterError
+          );
 
-      const connection = await amqp.connect(
-        `amqp://admin:admin123@${MASTER_HOST}:${QUEUE_PORT}`
-      );
-      console.log(
-        `[RabbitMQ] 마스터 노드(${MASTER_HOST}:${QUEUE_PORT}) 연결 성공`
-      );
-
-      const channel = await connection.createChannel();
-      // 메시지 큐 컨슈머 설정
-      await channel.prefetch(1); // <-- 추가: 한 번에 하나의 메시지만 처리
-      await channel.assertQueue("chat_messages", { durable: true });
-      console.log("[RabbitMQ] 채널 생성 완료");
-      console.log("[RabbitMQ] chat_messages 큐 설정 완료");
-
-      // 연결 에러 처리
-      connection.on("error", async (err) => {
-        console.error("RabbitMQ 마스터 연결 오류:", err);
-        messageQueueChannel = null; // 기존 채널 초기화
-
-        for (const host of SLAVE_HOSTS) {
-          try {
-            const slaveConnection = await amqp.connect(
-              `amqp://admin:admin123@${host}:${QUEUE_PORT}`
-            );
-            const slaveChannel = await slaveConnection.createChannel();
-            await slaveChannel.prefetch(1);
-            await slaveChannel.assertQueue("chat_messages", {
-              durable: true,
-            });
-
-            // 슬레이브 채널로 교체
-            messageQueueChannel = slaveChannel;
-
-            // 슬레이브에서도 동일한 컨슈머 설정
-            await setupConsumer(slaveChannel);
-            return;
-          } catch (slaveErr) {
-            console.error(`슬레이브 노드 ${host} 연결 실패:`, slaveErr);
-          }
-        }
-      });
-
-      messageQueueChannel = channel;
-
-      channel.consume("chat_messages", async (msg) => {
-        if (msg !== null) {
-          try {
-            console.log("[RabbitMQ] Message received from queue:", {
-              content: msg.content.toString(),
-              timestamp: new Date(),
-            });
-            const messageData = JSON.parse(msg.content.toString());
-            const processedMessage = await processQueueMessage(messageData);
-            if (processedMessage) {
-              await io
-                .to(processedMessage.room)
-                .emit("message", processedMessage);
+          // Slave 노드들 시도
+          for (const slaveHost of SLAVE_HOSTS) {
+            try {
+              this.connection = await this.connectToHost(slaveHost);
+              console.log(`[RabbitMQ] Slave(${slaveHost}) 연결 성공`);
+              lastError = null;
+              break;
+            } catch (slaveError) {
+              lastError = slaveError;
+              console.error(
+                `[RabbitMQ] Slave(${slaveHost}) 연결 실패:`,
+                slaveError
+              );
             }
-            await channel.ack(msg);
-          } catch (error) {
-            console.error("Message processing error:", error);
-            await channel.nack(msg, false, true);
           }
         }
+
+        if (!this.connection || lastError) {
+          throw new Error("모든 RabbitMQ 노드 연결 실패");
+        }
+
+        this.channel = await this.connection.createChannel();
+        await this.channel.prefetch(1);
+
+        // 채널 설정
+        await this.channel.assertExchange("chat_exchange", "direct", {
+          durable: true,
+        });
+
+        // 이벤트 핸들러 설정
+        this.connection.on("error", this.handleConnectionError.bind(this));
+        this.connection.on("close", this.handleConnectionClose.bind(this));
+
+        return this.channel;
+      } catch (error) {
+        console.error("[RabbitMQ] Initialization error:", error);
+        throw error;
+      }
+    },
+
+    async connectToHost(host) {
+      return await amqp.connect({
+        hostname: host,
+        port: QUEUE_PORT,
+        username: "admin",
+        password: "admin123",
+        heartbeat: 60,
+        connectionTimeout: 10000,
       });
-    } catch (error) {
-      console.error("Message Queue 연결 실패:", error);
-      throw error;
-    }
+    },
+
+    async getChannel() {
+      if (!this.channel || !this.connection || this.connection.closed) {
+        await this.initialize();
+      }
+      return this.channel;
+    },
+
+    async setupRoomQueue(roomId) {
+      const channel = await this.getChannel();
+      const queueName = `chat_messages_${roomId}_${SERVER_ID}`;
+
+      await channel.assertQueue(queueName, {
+        durable: true,
+        autoDelete: true,
+      });
+      await channel.bindQueue(queueName, "chat_exchange", `chat.${roomId}`);
+
+      return queueName;
+    },
+
+    async handleConnectionError(error) {
+      console.error("[RabbitMQ] Connection error:", error);
+
+      const retryDelay = 5000;
+      console.log(`[RabbitMQ] ${retryDelay / 1000}초 후 재연결 시도`);
+
+      setTimeout(async () => {
+        try {
+          await this.initialize();
+        } catch (err) {
+          console.error("[RabbitMQ] Reconnection failed:", err);
+        }
+      }, retryDelay);
+    },
+
+    async handleConnectionClose() {
+      console.log("[RabbitMQ] Connection closed");
+      this.channel = null;
+      this.connection = null;
+    },
   };
 
-  // 메시지 큐 처리 함수
+  // 메시지 처리 함수
   const processQueueMessage = async (messageData) => {
     const { room, sender, type, content, fileData } = messageData;
     let message;
@@ -128,7 +165,6 @@ module.exports = function (io) {
             if (file) {
               let s3FileData = null;
 
-              // 파일이 local에 있는 경우 S3로 업로드
               if (!file.s3Key && file.path) {
                 try {
                   const key = s3Service.generateKey(file, sender);
@@ -141,7 +177,6 @@ module.exports = function (io) {
                     key
                   );
 
-                  // 파일 정보 업데이트
                   file.s3Key = s3FileData.key;
                   file.s3Url = s3FileData.url;
                   await file.save();
@@ -188,13 +223,6 @@ module.exports = function (io) {
 
       if (message) {
         await message.save();
-        console.log("[MongoDB] Message saved:", {
-          messageId: message._id,
-          room: message.room,
-          type: message.type,
-          timestamp: new Date(),
-        });
-
         await message.populate([
           { path: "sender", select: "name email profileImage" },
           {
@@ -202,9 +230,7 @@ module.exports = function (io) {
             select: "filename originalname mimetype size s3Key s3Url",
           },
         ]);
-        console.log("[MongoDB] Message populated with sender and file info");
 
-        // Redis 캐시 업데이트
         try {
           const redisKey = `room:${room}:messages`;
           const cachedMessages = (await redisClient.get(redisKey)) || [];
@@ -213,20 +239,11 @@ module.exports = function (io) {
             cachedMessages.unshift(message);
             const updatedMessages = cachedMessages.slice(0, 100);
             await redisClient.set(redisKey, updatedMessages);
-            console.log(
-              "[Redis] Cache updated with new message. Total messages:",
-              updatedMessages.length
-            );
           } else {
             await redisClient.set(redisKey, [message]);
-            console.log("[Redis] New cache created with message");
           }
         } catch (redisError) {
-          console.error("[Redis] Cache update error:", {
-            error: redisError.message,
-            room,
-            messageId: message._id,
-          });
+          console.error("[Redis] Cache update error:", redisError);
         }
       }
 
@@ -254,13 +271,11 @@ module.exports = function (io) {
     });
 
     try {
-      // 쿼리 구성
       const query = { room: roomId };
       if (before) {
         query.timestamp = { $lt: new Date(before) };
       }
 
-      // 메시지 로드 with profileImage
       const messages = await Promise.race([
         Message.find(query)
           .populate("sender", "name email profileImage")
@@ -274,14 +289,12 @@ module.exports = function (io) {
         timeoutPromise,
       ]);
 
-      // 결과 처리
       const hasMore = messages.length > limit;
       const resultMessages = messages.slice(0, limit);
       const sortedMessages = resultMessages.sort(
         (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
       );
 
-      // 읽음 상태 비동기 업데이트
       if (sortedMessages.length > 0 && socket.user) {
         const messageIds = sortedMessages.map((msg) => msg._id);
         Message.updateMany(
@@ -297,11 +310,7 @@ module.exports = function (io) {
               },
             },
           }
-        )
-          .exec()
-          .catch((error) => {
-            console.error("Read status update error:", error);
-          });
+        ).exec();
       }
 
       return {
@@ -310,21 +319,7 @@ module.exports = function (io) {
         oldestTimestamp: sortedMessages[0]?.timestamp || null,
       };
     } catch (error) {
-      if (error.message === "Message loading timed out") {
-        logDebug("message load timeout", {
-          roomId,
-          before,
-          limit,
-        });
-      } else {
-        console.error("Load messages error:", {
-          error: error.message,
-          stack: error.stack,
-          roomId,
-          before,
-          limit,
-        });
-      }
+      console.error("Load messages error:", error);
       throw error;
     }
   };
@@ -412,9 +407,6 @@ module.exports = function (io) {
     }
   };
 
-  // Message Queue 초기화
-  connectMessageQueue().catch(console.error);
-
   // 미들웨어: 소켓 연결 시 인증 처리
   io.use(async (socket, next) => {
     try {
@@ -430,13 +422,24 @@ module.exports = function (io) {
         return next(new Error("Invalid token"));
       }
 
-      // 이미 연결된 사용자인지 확인
       const existingSocketId = connectedUsers.get(decoded.user.id);
       if (existingSocketId) {
         const existingSocket = io.sockets.sockets.get(existingSocketId);
         if (existingSocket) {
-          // 중복 로그인 처리
-          await handleDuplicateLogin(existingSocket, socket);
+          existingSocket.emit("duplicate_login", {
+            type: "new_login_attempt",
+            deviceInfo: socket.handshake.headers["user-agent"],
+            ipAddress: socket.handshake.address,
+            timestamp: Date.now(),
+          });
+
+          setTimeout(() => {
+            existingSocket.emit("session_ended", {
+              reason: "duplicate_login",
+              message: "다른 기기에서 로그인하여 현재 세션이 종료되었습니다.",
+            });
+            existingSocket.disconnect(true);
+          }, DUPLICATE_LOGIN_TIMEOUT);
         }
       }
 
@@ -445,7 +448,6 @@ module.exports = function (io) {
         sessionId
       );
       if (!validationResult.isValid) {
-        console.error("Session validation failed:", validationResult);
         return next(new Error(validationResult.message || "Invalid session"));
       }
 
@@ -463,27 +465,34 @@ module.exports = function (io) {
       };
 
       await SessionService.updateLastActivity(decoded.user.id);
+      await redisClient.set(
+        "user_sockets",
+        user._id.toString(),
+        JSON.stringify({ serverId: SERVER_ID, socketId: socket.id })
+      );
+
+      // RabbitMQ 연결 상태 확인
+      const channel = await queueManager.getChannel().catch((error) => {
+        console.error("[RabbitMQ] Channel initialization error:", error);
+        throw new Error("메시지 서비스 연결 실패");
+      });
+
+      if (!channel) {
+        throw new Error("메시지 서비스 준비 실패");
+      }
+
       next();
     } catch (error) {
       console.error("Socket authentication error:", error);
-
-      if (error.name === "TokenExpiredError") {
-        return next(new Error("Token expired"));
-      }
-
-      if (error.name === "JsonWebTokenError") {
-        return next(new Error("Invalid token"));
-      }
-
-      next(new Error("Authentication failed"));
+      next(new Error(error.message || "Authentication failed"));
     }
   });
 
+  // Socket 연결 처리
   io.on("connection", (socket) => {
     logDebug("socket connected", {
       socketId: socket.id,
       userId: socket.user?.id,
-      userName: socket.user?.name,
     });
 
     if (socket.user) {
@@ -630,6 +639,14 @@ module.exports = function (io) {
             userId: socket.user.id,
             roomId: currentRoom,
           });
+
+          // 기존 Consumer 정리
+          if (socket.consumers?.[currentRoom]) {
+            const channel = await queueManager.getChannel();
+            await channel.cancel(socket.consumers[currentRoom].consumerTag);
+            delete socket.consumers[currentRoom];
+          }
+
           socket.leave(currentRoom);
           userRooms.delete(socket.user.id);
 
@@ -652,6 +669,31 @@ module.exports = function (io) {
         if (!room) {
           throw new Error("채팅방을 찾을 수 없습니다.");
         }
+
+        // Queue 설정
+        const queueName = await queueManager.setupRoomQueue(roomId);
+        const channel = await queueManager.getChannel();
+
+        // Consumer 설정
+        const consumer = await channel.consume(queueName, async (msg) => {
+          if (msg !== null) {
+            try {
+              const messageData = JSON.parse(msg.content.toString());
+              const processedMessage = await processQueueMessage(messageData);
+              if (processedMessage) {
+                io.to(messageData.room).emit("message", processedMessage);
+              }
+              await channel.ack(msg);
+            } catch (error) {
+              console.error("Message processing error:", error);
+              await channel.nack(msg, false, true);
+            }
+          }
+        });
+
+        // Consumer 저장
+        socket.consumers = socket.consumers || {};
+        socket.consumers[roomId] = consumer;
 
         socket.join(roomId);
         userRooms.set(socket.user.id, roomId);
@@ -746,7 +788,7 @@ module.exports = function (io) {
           throw new Error("세션이 만료되었습니다. 다시 로그인해주세요.");
         }
 
-        // 메시지 큐로 전송
+        // 메시지 큐로 전송할 데이터 준비
         const queueMessage = {
           ...messageData,
           sender: socket.user.id,
@@ -768,23 +810,32 @@ module.exports = function (io) {
           },
         });
 
-        // 메시지 큐로만 전송
-        if (messageQueueChannel) {
-          await messageQueueChannel.sendToQueue(
-            "chat_messages",
+        // 메시지 큐로 전송
+        try {
+          const channel = await queueManager.getChannel();
+          await channel.publish(
+            "chat_exchange",
+            `chat.${room}`,
             Buffer.from(JSON.stringify(queueMessage)),
             { persistent: true }
           );
-          console.log("[RabbitMQ] Message sent to queue:", {
-            room: queueMessage.room,
-            type: queueMessage.type,
+
+          logDebug("message queued", {
+            room: room,
+            type: type,
+            queueType: "chat_exchange",
+            routingKey: `chat.${room}`,
             timestamp: new Date(),
           });
+        } catch (queueError) {
+          console.error("[RabbitMQ] Message queue error:", queueError);
+          throw new Error(
+            "메시지 전송 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+          );
         }
 
         // AI 멘션 확인
         const aiMentions = extractAIMentions(content);
-        let message;
 
         logDebug("message received", {
           type,
@@ -839,6 +890,13 @@ module.exports = function (io) {
         if (!room) {
           console.log(`Room ${roomId} not found or user has no access`);
           return;
+        }
+
+        // Consumer 정리
+        if (socket.consumers?.[roomId]) {
+          const channel = await queueManager.getChannel();
+          await channel.cancel(socket.consumers[roomId].consumerTag);
+          delete socket.consumers[roomId];
         }
 
         socket.leave(roomId);
