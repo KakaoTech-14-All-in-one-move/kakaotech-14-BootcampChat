@@ -39,21 +39,33 @@ module.exports = function (io) {
       );
 
       const channel = await connection.createChannel();
+      // 메시지 큐 컨슈머 설정
+      await channel.prefetch(1); // <-- 추가: 한 번에 하나의 메시지만 처리
       await channel.assertQueue("chat_messages", { durable: true });
       console.log("[RabbitMQ] 채널 생성 완료");
       console.log("[RabbitMQ] chat_messages 큐 설정 완료");
 
+      // 연결 에러 처리
       connection.on("error", async (err) => {
         console.error("RabbitMQ 마스터 연결 오류:", err);
+        messageQueueChannel = null; // 기존 채널 초기화
+
         for (const host of SLAVE_HOSTS) {
           try {
             const slaveConnection = await amqp.connect(
               `amqp://admin:admin123@${host}:${QUEUE_PORT}`
             );
-            messageQueueChannel = await slaveConnection.createChannel();
-            await messageQueueChannel.assertQueue("chat_messages", {
+            const slaveChannel = await slaveConnection.createChannel();
+            await slaveChannel.prefetch(1);
+            await slaveChannel.assertQueue("chat_messages", {
               durable: true,
             });
+
+            // 슬레이브 채널로 교체
+            messageQueueChannel = slaveChannel;
+
+            // 슬레이브에서도 동일한 컨슈머 설정
+            await setupConsumer(slaveChannel);
             return;
           } catch (slaveErr) {
             console.error(`슬레이브 노드 ${host} 연결 실패:`, slaveErr);
@@ -63,7 +75,6 @@ module.exports = function (io) {
 
       messageQueueChannel = channel;
 
-      // 메시지 큐 컨슈머 설정
       channel.consume("chat_messages", async (msg) => {
         if (msg !== null) {
           try {
@@ -74,12 +85,14 @@ module.exports = function (io) {
             const messageData = JSON.parse(msg.content.toString());
             const processedMessage = await processQueueMessage(messageData);
             if (processedMessage) {
-              io.to(processedMessage.room).emit("message", processedMessage);
+              await io
+                .to(processedMessage.room)
+                .emit("message", processedMessage);
             }
-            channel.ack(msg);
+            await channel.ack(msg);
           } catch (error) {
             console.error("Message processing error:", error);
-            channel.nack(msg);
+            await channel.nack(msg, false, true);
           }
         }
       });
